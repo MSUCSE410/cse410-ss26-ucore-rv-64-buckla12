@@ -51,6 +51,8 @@ int run_all_app()
 		/*
 		* LAB1: you may need to initialize your new fields of proc here
 		*/
+		p->taskinfo->status = Running;
+		p->taskinfo->time = 0;
 	}
 	return 0;
 }
