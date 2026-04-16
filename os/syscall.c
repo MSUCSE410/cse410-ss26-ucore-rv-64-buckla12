@@ -5,6 +5,7 @@
 #include "syscall_ids.h"
 #include "timer.h"
 #include "trap.h"
+#include "vm.h"
 
 uint64 sys_write(int fd, uint64 va, uint len)
 {
@@ -59,6 +60,94 @@ uint64 sys_gettimeofday(uint64 val, int _tz)
 	return 0;
 }
 
+int sys_mmap(uint64 start, unsigned long long len, int port, int flag, int fd){
+	if(len > 1073741824 || (port & ~0x7) != 0 || (port & 0x7) == 0 || !PGALIGNED(start)){
+		printf("Error: Parameters recieved incorect\n");
+		return -1;
+	}
+	else if(len ==0){
+		return 0;
+	}
+	struct proc *p = curr_proc();
+	unsigned long long rounded = PGROUNDUP(len);
+	unsigned long long s = (unsigned long long)start;
+	for(unsigned long long temp = s; temp < s + rounded; temp+=PGSIZE){
+		pte_t *pte = walk(p->pagetable, temp, 0);
+		
+		if (pte == 0){
+
+		}
+		else if(*pte & PTE_V){
+			printf("Error: Already allocated\n");
+			return -1;
+		}
+	}
+	int flags = PTE_U;
+
+	if (port & 1) flags |= PTE_R;
+	if (port & 2) flags |= PTE_W;
+	if (port & 4) flags |= PTE_X;
+	for(unsigned long long temp = s; temp < s + rounded; temp+=PGSIZE){
+		void* pPage = kalloc();
+		if(pPage == 0){
+			return -1;
+		}
+		pte_t *pte = walk(p->pagetable, temp, 1);
+
+		*pte = PA2PTE(pPage) | PTE_V | flags;
+	}
+	return 0;
+}
+
+int sys_munmap(uint64 start, unsigned long long len){
+	if(!PGALIGNED(start)){
+		printf("Error: Not page aligned\n");
+		return -1;
+	}
+	struct proc *p = curr_proc();
+	unsigned long long rounded = PGROUNDUP(len);
+	unsigned long long s = (unsigned long long)start;
+	for(unsigned long long temp = s; temp < s + rounded; temp+=PGSIZE){
+		pte_t *pte = walk(p->pagetable, temp, 0);
+		
+		if (!(*pte & PTE_V)){
+			printf("Error: Page %d was not valid\n", temp%PGSIZE);
+			return -1;
+			
+		}
+	}
+	for(unsigned long long temp = s; temp < s + rounded; temp+=PGSIZE){
+		pte_t *pte = walk(p->pagetable, temp, 0);
+		uint64 pPage= (uint64)PTE2PA(*pte);
+		kfree((void*)pPage);
+		*pte = *pte & ~PTE_V;
+	}
+	return 0;
+}
+/*
+* LAB1: you may need to define sys_task_info here
+*/
+int sys_task_info(uint64 ti){
+	struct proc* process = curr_proc();
+	if (ti == 0) 
+		return -1;
+
+    uint64 pa = useraddr(process->pagetable, ti);
+    if (pa == 0)
+        return -1;
+
+    TaskInfo *user_ti = (TaskInfo *)pa;
+	user_ti->status = Running;
+	user_ti->time = (get_cycle() / (CPU_FREQ / 1000)) - process->taskinfo->time;
+
+    for (int i = 0; i < MAX_SYSCALL_NUM; i++) {
+        user_ti->syscall_times[i] = process->taskinfo->syscall_times[i];
+    }
+    return 0;
+}
+
+
+
 uint64 sys_getpid()
 {
 	return curr_proc()->pid;
@@ -92,15 +181,55 @@ uint64 sys_wait(int pid, uint64 va)
 	return wait(pid, code);
 }
 
-uint64 sys_spawn(uint64 va)
+int sys_spawn(uint64 va)
 {
-	// TODO: your job is to complete the sys call
-	return -1;
+	struct proc *np;
+    struct proc *p = curr_proc();
+    char filename[200];
+    
+    if (copyinstr(p->pagetable, filename, va, 200) < 0) {
+        return -1; 
+    }
+    
+    if ((np = allocproc()) == 0) {
+        return -1;
+    }
+    
+    memset(np->trapframe, 0, sizeof(*np->trapframe));
+    
+    
+    np->parent = p;
+    
+    int id = get_id_by_name(filename);
+    if (id < 0) {
+        np->state = UNUSED;
+        return -1;
+    }
+    
+    if (loader(id, np) < 0) {
+        np->state = UNUSED;
+        return -1;
+    }
+    
+    np->trapframe->a0 = 0;
+    
+    np->state = RUNNABLE;
+    add_task(np);
+    
+    return np->pid;
 }
 
 uint64 sys_set_priority(long long prio){
     // TODO: your job is to complete the sys call
-    return -1;
+    struct proc *process = curr_proc();
+    
+    if(prio < 2){
+        return -1;
+    }
+    
+    process->priority = (int)prio;
+    process->pass = BIG_STRIDE / process->priority;
+    return (uint64)process->priority;
 }
 
 
@@ -114,6 +243,9 @@ void syscall()
 			   trapframe->a3, trapframe->a4, trapframe->a5 };
 	tracef("syscall %d args = [%x, %x, %x, %x, %x, %x]", id, args[0],
 	       args[1], args[2], args[3], args[4], args[5]);
+	if(id < MAX_SYSCALL_NUM){
+		curr_proc()->taskinfo->syscall_times[id]++;
+	}
 	switch (id) {
 	case SYS_write:
 		ret = sys_write(args[0], args[1], args[2]);
@@ -129,6 +261,18 @@ void syscall()
 		break;
 	case SYS_gettimeofday:
 		ret = sys_gettimeofday(args[0], args[1]);
+		break;
+	case SYS_task_info:
+		ret = sys_task_info(args[0]);
+		break;
+	case SYS_mmap:
+		ret = sys_mmap(args[0], args[1], args[2], args[3], args[4]);
+		break;
+	case SYS_munmap:
+		ret = sys_munmap(args[0], args[1]);
+		break;
+	case SYS_setpriority:
+		ret = sys_set_priority(args[0]);
 		break;
 	case SYS_getpid:
 		ret = sys_getpid();

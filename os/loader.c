@@ -1,6 +1,7 @@
 #include "loader.h"
 #include "defs.h"
 #include "trap.h"
+#include "timer.h"
 
 static int app_num;
 static uint64 *app_info_ptr;
@@ -82,6 +83,8 @@ int bin_loader(uint64 start, uint64 end, struct proc *p)
 
 int loader(int app_id, struct proc *p)
 {
+	p->taskinfo->status = Running;
+	p->taskinfo->time = get_cycle() / (CPU_FREQ/1000);
 	return bin_loader(app_info_ptr[app_id], app_info_ptr[app_id + 1], p);
 }
 

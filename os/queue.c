@@ -1,5 +1,7 @@
 #include "queue.h"
 #include "defs.h"
+#include "proc.h" 
+extern struct proc pool[NPROC];
 
 void init_queue(struct queue *q)
 {
@@ -27,3 +29,4 @@ int pop_queue(struct queue *q)
 		q->empty = 1;
 	return value;
 }
+

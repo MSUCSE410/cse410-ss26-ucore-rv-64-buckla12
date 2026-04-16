@@ -8,6 +8,7 @@
 struct proc pool[NPROC];
 __attribute__((aligned(16))) char kstack[NPROC][PAGE_SIZE];
 __attribute__((aligned(4096))) char trapframe[NPROC][TRAP_PAGE_SIZE];
+TaskInfo taskinfo[NPROC];
 
 extern char boot_stack_top[];
 struct proc *current_proc;
@@ -32,6 +33,18 @@ void proc_init()
 		p->state = UNUSED;
 		p->kstack = (uint64)kstack[p - pool];
 		p->trapframe = (struct trapframe *)trapframe[p - pool];
+		
+		// Added stuff
+		p->taskinfo = &taskinfo[p - pool];
+		p->taskinfo->status = UnInit;
+		p->stride = 0;
+		p->priority = 16;
+		p->pass = BIG_STRIDE / 16; 
+
+		for(int i = 0; i < MAX_SYSCALL_NUM; i++){
+			p->taskinfo->syscall_times[i] = 0;
+		}
+		
 	}
 	idle.kstack = (uint64)boot_stack_top;
 	idle.pid = IDLE_PID;
@@ -46,7 +59,7 @@ int allocpid()
 }
 
 struct proc *fetch_task()
-{
+{	
 	int index = pop_queue(&task_queue);
 	if (index < 0) {
 		debugf("No task to fetch\n");
@@ -58,7 +71,7 @@ struct proc *fetch_task()
 
 void add_task(struct proc *p)
 {
-	push_queue(&task_queue, p - pool);
+	//push_queue(&task_queue, p - pool);
 	debugf("add task %d(pid=%d) to task queue\n", p - pool, p->pid);
 }
 
@@ -89,6 +102,13 @@ found:
 	memset((void *)p->trapframe, 0, TRAP_PAGE_SIZE);
 	p->context.ra = (uint64)usertrapret;
 	p->context.sp = p->kstack + KSTACK_SIZE;
+	p->stride = 0;	
+	p->priority = 16;
+	p->pass = BIG_STRIDE / 16;
+	p->taskinfo->status = UnInit;
+	for (int i = 0; i < MAX_SYSCALL_NUM; i++) {
+		p->taskinfo->syscall_times[i] = 0;
+	}
 	return p;
 }
 
@@ -97,27 +117,47 @@ found:
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
-void scheduler()
+
+/*
 {
 	struct proc *p;
+	
 	for (;;) {
-		/*int has_proc = 0;
-		for (p = pool; p < &pool[NPROC]; p++) {
-			if (p->state == RUNNABLE) {
-				has_proc = 1;
-				tracef("swtich to proc %d", p - pool);
-				p->state = RUNNING;
-				current_proc = p;
-				swtch(&idle.context, &p->context);
-			}
-		}
-		if(has_proc == 0) {
-			panic("all app are over!\n");
-		}*/
 		p = fetch_task();
 		if (p == NULL) {
 			panic("all app are over!\n");
 		}
+		
+		p->stride += p->pass;
+		tracef("swtich to proc %d", p - pool);
+		p->state = RUNNING;
+		current_proc = p;
+		swtch(&idle.context, &p->context);*/
+	//*/
+	
+	
+void scheduler(){
+	struct proc *p;
+	for (;;) {
+		
+		int has_proc = 0;
+		struct proc *best = NULL;
+		for (p = pool; p < &pool[NPROC]; p++) {
+			if (best == NULL && p != NULL && p->state == RUNNABLE){
+				best = p;
+				has_proc = 1;
+			}
+			else if (p->state == RUNNABLE && p->stride < best->stride) {
+				has_proc = 1;
+				best = p; 
+			}
+		}
+		if (has_proc == 0) {
+			panic("all app are over!\n");
+		}
+		
+		p = best;
+		p->stride += p->pass;
 		tracef("swtich to proc %d", p - pool);
 		p->state = RUNNING;
 		current_proc = p;
@@ -143,9 +183,11 @@ void sched()
 // Give up the CPU for one scheduling round.
 void yield()
 {
-	current_proc->state = RUNNABLE;
-	add_task(current_proc);
-	sched();
+	struct proc *p = curr_proc();
+	if(p && p->state == RUNNING) {
+		p->state = RUNNABLE;
+		sched();
+	}
 }
 
 // Free a process's page table, and free the
@@ -197,7 +239,13 @@ int exec(char *name)
 	uvmunmap(p->pagetable, 0, p->max_page, 1);
 	p->max_page = 0;
 	loader(id, p);
-	return 0;
+
+	//p->priority = 16;
+	//p->stride = 0;
+	//p->pass = BIG_STRIDE / 16;
+
+	usertrapret();
+	__builtin_unreachable();
 }
 
 int wait(int pid, int *code)
