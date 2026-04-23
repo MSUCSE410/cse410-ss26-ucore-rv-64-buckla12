@@ -5,6 +5,13 @@
 #include "syscall_ids.h"
 #include "timer.h"
 #include "trap.h"
+#include "vm.h"
+#include "file.h"
+#include "plic.h"
+
+// File types only need to be considered.
+#define DIR 0x040000 // directory
+#define FILE 0x100000 // ordinary regular file
 
 uint64 console_write(uint64 va, uint64 len)
 {
@@ -49,6 +56,91 @@ uint64 sys_write(int fd, uint64 va, uint64 len)
 	default:
 		panic("unknown file type %d\n", f->type);
 	}
+}
+int sys_mmap(uint64 start, unsigned long long len, int port, int flag, int fd){
+	if(len > 1073741824 || (port & ~0x7) != 0 || (port & 0x7) == 0 || !PGALIGNED(start)){
+		printf("Error: Parameters recieved incorect\n");
+		return -1;
+	}
+	else if(len ==0){
+		return 0;
+	}
+	struct proc *p = curr_proc();
+	unsigned long long rounded = PGROUNDUP(len);
+	unsigned long long s = (unsigned long long)start;
+	for(unsigned long long temp = s; temp < s + rounded; temp+=PGSIZE){
+		pte_t *pte = walk(p->pagetable, temp, 0);
+		
+		if (pte == 0){
+
+		}
+		else if(*pte & PTE_V){
+			printf("Error: Already allocated\n");
+			return -1;
+		}
+	}
+	int flags = PTE_U;
+
+	if (port & 1) flags |= PTE_R;
+	if (port & 2) flags |= PTE_W;
+	if (port & 4) flags |= PTE_X;
+	for(unsigned long long temp = s; temp < s + rounded; temp+=PGSIZE){
+		void* pPage = kalloc();
+		if(pPage == 0){
+			return -1;
+		}
+		pte_t *pte = walk(p->pagetable, temp, 1);
+
+		*pte = PA2PTE(pPage) | PTE_V | flags;
+	}
+	return 0;
+}
+
+int sys_munmap(uint64 start, unsigned long long len){
+	if(!PGALIGNED(start)){
+		printf("Error: Not page aligned\n");
+		return -1;
+	}
+	struct proc *p = curr_proc();
+	unsigned long long rounded = PGROUNDUP(len);
+	unsigned long long s = (unsigned long long)start;
+	for(unsigned long long temp = s; temp < s + rounded; temp+=PGSIZE){
+		pte_t *pte = walk(p->pagetable, temp, 0);
+		
+		if (!(*pte & PTE_V)){
+			printf("Error: Page %d was not valid\n", temp%PGSIZE);
+			return -1;
+			
+		}
+	}
+	for(unsigned long long temp = s; temp < s + rounded; temp+=PGSIZE){
+		pte_t *pte = walk(p->pagetable, temp, 0);
+		uint64 pPage= (uint64)PTE2PA(*pte);
+		kfree((void*)pPage);
+		*pte = *pte & ~PTE_V;
+	}
+	return 0;
+}
+/*
+* LAB1: you may need to define sys_task_info here
+*/
+int sys_task_info(uint64 ti){
+	struct proc* process = curr_proc();
+	if (ti == 0) 
+		return -1;
+
+    uint64 pa = useraddr(process->pagetable, ti);
+    if (pa == 0)
+        return -1;
+
+    TaskInfo *user_ti = (TaskInfo *)pa;
+	user_ti->status = Running;
+	user_ti->time = (get_cycle() / (CPU_FREQ / 1000)) - process->taskinfo->time;
+
+    for (int i = 0; i < MAX_SYSCALL_NUM; i++) {
+        user_ti->syscall_times[i] = process->taskinfo->syscall_times[i];
+    }
+    return 0;
 }
 
 uint64 sys_read(int fd, uint64 va, uint64 len)
@@ -144,14 +236,57 @@ uint64 sys_wait(int pid, uint64 va)
 
 uint64 sys_spawn(uint64 va)
 {
-	// TODO: your job is to complete the sys call
-	return -1;
+	struct proc *np;
+    struct proc *p = curr_proc();
+    char filename[200];
+    
+    if (copyinstr(p->pagetable, filename, va, 200) < 0) {
+        return -1; 
+    }
+    
+    if ((np = allocproc()) == 0) {
+        return -1;
+    }
+    
+    memset(np->trapframe, 0, sizeof(*np->trapframe));
+    
+    
+    np->parent = p;
+    
+    struct inode *ip;
+    if ((ip = namei(filename)) == 0) {
+        errorf("invalid file name: %s\n", filename);
+        np->state = UNUSED;
+        return -1;
+    }
+    
+    if (bin_loader(ip, np) < 0) {
+        iput(ip);  // Don't forget to release the inode
+        np->state = UNUSED;
+        return -1;
+    }
+    
+    iput(ip);  // Release the inode after loading
+    
+    np->trapframe->a0 = 0;
+    
+    np->state = RUNNABLE;
+    add_task(np);
+    
+    return (uint64)np->pid;
 }
 
-uint64 sys_set_priority(long long prio)
-{
-	// TODO: your job is to complete the sys call
-	return -1;
+uint64 sys_set_priority(long long prio){
+    // TODO: your job is to complete the sys call
+    struct proc *process = curr_proc();
+    
+    if(prio < 2){
+        return -1;
+    }
+    
+    process->priority = (int)prio;
+    process->pass = BIG_STRIDE / process->priority;
+    return (uint64)process->priority;
 }
 
 uint64 sys_openat(uint64 va, uint64 omode, uint64 _flags)
@@ -177,19 +312,163 @@ uint64 sys_close(int fd)
 	return 0;
 }
 
-int sys_fstat(int fd,uint64 stat){
-	//TODO: your job is to complete the syscall
-	return -1;
+int sys_fstat(int fd, uint64 stat_addr){
+	struct proc *p = curr_proc();
+    struct Stat st;
+    struct file *f;
+	
+
+    if (fd < 0 || fd >= FD_BUFFER_SIZE || p->files[fd] == 0) {
+        return -1;
+    }
+    
+    f = p->files[fd];
+    
+    if (stat_addr == 0 || stat_addr >= 0x80000000) {
+        return -1;
+    }
+    
+    if (f->type == FD_INODE) {
+        ivalid(f->ip);
+        
+        st.dev = 0;
+        st.ino = f->ip->inum;
+        st.nlink = f->ip->nlink;
+        
+        if (f->ip->type == T_DIR) {
+            st.mode = DIR; 
+        } else if (f->ip->type == T_FILE) {
+            st.mode = FILE;
+        } else {
+            return -1;
+        }
+        
+
+        for (int i = 0; i < 7; i++) {
+            st.pad[i] = 0;
+        }
+        
+        if (either_copyout(1, stat_addr, (char*)&st, sizeof(st)) < 0) {
+            return -1; 
+        }
+        
+        return 0; 
+    }
+    
+    return -1;
 }
 
-int sys_linkat(int olddirfd, uint64 oldpath, int newdirfd, uint64 newpath, uint64 flags){
-	//TODO: your job is to complete the syscall
-	return -1;
+int sys_linkat(int olddirfd, uint64 oldpath_ptr, int newdirfd, uint64 newpath_ptr, uint64 flags){
+	char oldpath[MAXPATH], newpath[MAXPATH];
+
+	if (copyinstr(curr_proc()->pagetable, oldpath, oldpath_ptr, MAXPATH) < 0 || copyinstr(curr_proc()->pagetable, newpath, newpath_ptr, MAXPATH) < 0) {
+    	return -1;
+	}
+
+    struct inode *ip, *dp;
+    ip = namei(oldpath);
+    if (ip == 0) return -1;
+	ivalid(ip);
+
+    char* last_slash = 0;
+    for (char* p = newpath; *p != '\0'; p++) {
+        if (*p == '/') {
+            last_slash = p;
+        }
+    }
+
+    char* filename;
+    if (last_slash == 0) {
+        dp = root_dir();
+        filename = newpath;
+    } else {
+        *last_slash = '\0'; 
+        dp = namei(newpath); 
+        *last_slash = '/';
+        filename = last_slash + 1; 
+    }
+
+    if (dp == 0) {
+        iput(ip);
+        return -1;
+    }
+	
+	ivalid(dp);
+	
+    if (dp->type != T_DIR) {
+        iput(ip);
+        iput(dp);
+        return -1;
+    }
+
+    if (dirlink(dp, filename, ip->inum) < 0) {
+        iput(ip);
+        iput(dp);
+        return -1;
+    }
+
+    ip->nlink++;
+    iupdate(ip);
+    iput(ip);
+    iput(dp);
+
+    return 0;
 }
 
-int sys_unlinkat(int dirfd, uint64 name, uint64 flags){
-	//TODO: your job is to complete the syscall
-	return -1;
+int sys_unlinkat(int dirfd, uint64 path_ptr, uint64 flags){
+	char path[MAXPATH];
+    char name[DIRSIZ];
+    struct inode *ip, *dp;
+
+    // copy path from user to kernel 
+    if (copyinstr(curr_proc()->pagetable, path, path_ptr, MAXPATH) < 0) {
+    	return -1;
+	}
+
+    
+    char* last_slash = 0;
+    for (char* p = path; *p != '\0'; p++) {
+        if (*p == '/') last_slash = p;
+    }
+
+    if (last_slash == 0) {
+        dp = root_dir();
+        strncpy(name, path, DIRSIZ);
+    } else {
+        *last_slash = '\0';
+        dp = namei(path);
+		*last_slash = '/';
+        strncpy(name, last_slash + 1, DIRSIZ);
+    }
+
+    if (dp == 0) return -1;
+    ivalid(dp);
+
+    if ((ip = dirlookup(dp, name, 0)) == 0) {
+        iput(dp);
+        return -1;
+    }
+    ivalid(ip);
+
+    if (ip->type == T_DIR) {
+        iput(ip);
+        iput(dp);
+        return -1;
+    }
+
+    if (dirunlink(dp, name, ip->inum) < 0) {
+        iput(ip);
+        iput(dp);
+        return -1;
+    }
+
+    ip->nlink--;
+    iupdate(ip);
+
+    iput(ip);
+    iput(dp);
+
+    return 0;
 }
 
 extern char trap_page[];
@@ -224,6 +503,15 @@ void syscall()
 	case SYS_gettimeofday:
 		ret = sys_gettimeofday(args[0], args[1]);
 		break;
+	case SYS_task_info:
+		ret = sys_task_info(args[0]);
+		break;
+	case SYS_mmap:
+		ret = sys_mmap(args[0], args[1], args[2], args[3], args[4]);
+		break;
+	case SYS_munmap:
+		ret = sys_munmap(args[0], args[1]);
+		break;
 	case SYS_getpid:
 		ret = sys_getpid();
 		break;
@@ -247,6 +535,7 @@ void syscall()
 		break;
 	case SYS_unlinkat:
 	    ret = sys_unlinkat(args[0],args[1],args[2]);
+		break;
 	case SYS_spawn:
 		ret = sys_spawn(args[0]);
 		break;

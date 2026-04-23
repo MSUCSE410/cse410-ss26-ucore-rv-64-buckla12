@@ -8,6 +8,7 @@
 struct proc pool[NPROC];
 __attribute__((aligned(16))) char kstack[NPROC][PAGE_SIZE];
 __attribute__((aligned(4096))) char trapframe[NPROC][TRAP_PAGE_SIZE];
+TaskInfo taskinfo[NPROC];
 
 extern char boot_stack_top[];
 struct proc *current_proc;
@@ -37,6 +38,16 @@ void proc_init()
 		p->state = UNUSED;
 		p->kstack = (uint64)kstack[p - pool];
 		p->trapframe = (struct trapframe *)trapframe[p - pool];
+
+		p->taskinfo = &taskinfo[p - pool];
+		p->taskinfo->status = UnInit;
+		p->stride = 0;
+		p->priority = 16;
+		p->pass = BIG_STRIDE / 16; 
+
+		for(int i = 0; i < MAX_SYSCALL_NUM; i++){
+			p->taskinfo->syscall_times[i] = 0;
+		}
 	}
 	idle.kstack = (uint64)boot_stack_top;
 	idle.pid = IDLE_PID;
@@ -96,6 +107,13 @@ found:
 	memset((void *)p->files, 0, sizeof(struct file *) * FD_BUFFER_SIZE);
 	p->context.ra = (uint64)usertrapret;
 	p->context.sp = p->kstack + KSTACK_SIZE;
+	p->stride = 0;	
+	p->priority = 16;
+	p->pass = BIG_STRIDE / 16;
+	p->taskinfo->status = UnInit;
+	for (int i = 0; i < MAX_SYSCALL_NUM; i++) {
+		p->taskinfo->syscall_times[i] = 0;
+	}
 	return p;
 }
 
@@ -115,27 +133,28 @@ int init_stdio(struct proc *p)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
-void scheduler()
-{
+void scheduler(){
 	struct proc *p;
 	for (;;) {
-		/*int has_proc = 0;
+		
+		int has_proc = 0;
+		struct proc *best = NULL;
 		for (p = pool; p < &pool[NPROC]; p++) {
-			if (p->state == RUNNABLE) {
+			if (best == NULL && p != NULL && p->state == RUNNABLE){
+				best = p;
 				has_proc = 1;
-				tracef("swtich to proc %d", p - pool);
-				p->state = RUNNING;
-				current_proc = p;
-				swtch(&idle.context, &p->context);
+			}
+			else if (p->state == RUNNABLE && p->stride < best->stride) {
+				has_proc = 1;
+				best = p; 
 			}
 		}
-		if(has_proc == 0) {
-			panic("all app are over!\n");
-		}*/
-		p = fetch_task();
-		if (p == NULL) {
+		if (has_proc == 0) {
 			panic("all app are over!\n");
 		}
+		
+		p = best;
+		p->stride += p->pass;
 		tracef("swtich to proc %d", p - pool);
 		p->state = RUNNING;
 		current_proc = p;
@@ -161,9 +180,11 @@ void sched()
 // Give up the CPU for one scheduling round.
 void yield()
 {
-	current_proc->state = RUNNABLE;
-	add_task(current_proc);
-	sched();
+	struct proc *p = curr_proc();
+	if(p && p->state == RUNNING) {
+		p->state = RUNNABLE;
+		sched();
+	}
 }
 
 // Free a process's page table, and free the

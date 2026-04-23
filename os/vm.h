@@ -5,6 +5,7 @@
 #include "types.h"
 
 void kvm_init();
+pte_t *walk(pagetable_t pagetable, uint64 va, int alloc);
 void kvmmap(pagetable_t, uint64, uint64, uint64, int);
 int mappages(pagetable_t, uint64, uint64, uint64, int);
 pagetable_t uvmcreate(uint64);
